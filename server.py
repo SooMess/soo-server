@@ -7,7 +7,6 @@ import hashlib
 import secrets
 import os
 import sys
-import traceback
 from datetime import datetime
 
 # ============================================
@@ -25,42 +24,59 @@ log("🚀 SERVER STARTING UP...")
 # БАЗА ДАННЫХ
 # ============================================
 
-conn = sqlite3.connect('soo_messages.db')
-c = conn.cursor()
+DB_PATH = "soo_messages.db"
 
-c.execute('''CREATE TABLE IF NOT EXISTS users
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id TEXT UNIQUE,
-              email TEXT UNIQUE,
-              username TEXT UNIQUE,
-              password_hash TEXT,
-              first_name TEXT,
-              last_name TEXT,
-              verified BOOLEAN DEFAULT 0,
-              created_at TIMESTAMP)''')
+def init_database():
+    """Инициализация базы данных"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Таблица пользователей
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id TEXT UNIQUE,
+                  email TEXT UNIQUE,
+                  username TEXT UNIQUE,
+                  password_hash TEXT,
+                  first_name TEXT,
+                  last_name TEXT,
+                  verified BOOLEAN DEFAULT 0,
+                  created_at TIMESTAMP)''')
+    
+    # Таблица кодов подтверждения
+    c.execute('''CREATE TABLE IF NOT EXISTS verification_codes
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  email TEXT,
+                  code TEXT,
+                  expires_at TIMESTAMP,
+                  attempts INTEGER DEFAULT 0)''')
+    
+    # Таблица сообщений
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  from_user TEXT,
+                  to_user TEXT,
+                  message TEXT,
+                  timestamp TIMESTAMP,
+                  delivered BOOLEAN DEFAULT 0,
+                  read BOOLEAN DEFAULT 0)''')
+    
+    conn.commit()
+    conn.close()
+    log("✅ Database initialized")
 
-c.execute('''CREATE TABLE IF NOT EXISTS verification_codes
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              email TEXT,
-              code TEXT,
-              expires_at TIMESTAMP,
-              attempts INTEGER DEFAULT 0)''')
+# Инициализируем БД при запуске
+init_database()
 
-c.execute('''CREATE TABLE IF NOT EXISTS messages
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              from_user TEXT,
-              to_user TEXT,
-              message TEXT,
-              timestamp TIMESTAMP,
-              delivered BOOLEAN DEFAULT 0,
-              read BOOLEAN DEFAULT 0)''')
-conn.commit()
-
-connected_clients = {}
+connected_clients = {}  # {user_id: websocket}
 
 # ============================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================
+
+def get_db_connection():
+    """Получить соединение с БД"""
+    return sqlite3.connect(DB_PATH)
 
 def generate_verification_code():
     return str(random.randint(1000, 9999))
@@ -79,7 +95,6 @@ def verify_password(password, password_hash):
         return False
 
 def show_code_in_logs(to_email, code):
-    """Вместо отправки email просто показываем код в логах"""
     log(f"🔑 КОД ПОДТВЕРЖДЕНИЯ для {to_email}: {code}")
     log(f"⚠️ Введите этот код в приложении для продолжения")
     return True
@@ -96,126 +111,33 @@ async def handler(websocket):
         async for message in websocket:
             data = json.loads(message)
             msg_type = data.get('type')
+            log(f"📨 Received: {msg_type}")
             
-            if msg_type == 'check_email':
-                email = data['email']
-                c.execute("SELECT user_id, username FROM users WHERE email = ?", (email,))
-                user = c.fetchone()
-                
-                await websocket.send(json.dumps({
-                    'type': 'email_exists',
-                    'exists': user is not None
-                }))
-                
-            elif msg_type == 'send_code':
-                email = data['email']
-                code = generate_verification_code()
-                
-                # Удаляем старые коды
-                c.execute("DELETE FROM verification_codes WHERE email = ?", (email,))
-                
-                # Сохраняем новый код
-                expires = datetime.now().timestamp() + 300
-                c.execute("INSERT INTO verification_codes (email, code, expires_at) VALUES (?, ?, ?)",
-                         (email, code, expires))
-                conn.commit()
-                
-                # ПОКАЗЫВАЕМ КОД В ЛОГАХ
-                show_code_in_logs(email, code)
-                
-                await websocket.send(json.dumps({
-                    'type': 'code_sent',
-                    'message': 'Код отправлен (проверьте логи Render)'
-                }))
-                
-            elif msg_type == 'verify_code':
-                email = data['email']
-                code = data['code']
-                
-                c.execute("SELECT code, expires_at FROM verification_codes WHERE email = ? ORDER BY id DESC LIMIT 1", (email,))
-                result = c.fetchone()
-                
-                if result:
-                    stored_code, expires_at = result
-                    if datetime.now().timestamp() < expires_at and stored_code == code:
-                        await websocket.send(json.dumps({
-                            'type': 'code_valid',
-                            'email': email
-                        }))
-                    else:
-                        await websocket.send(json.dumps({
-                            'type': 'code_invalid',
-                            'message': 'Неверный или просроченный код'
-                        }))
-                else:
+            conn = get_db_connection()
+            c = conn.cursor()
+            
+            try:
+                # 1️⃣ ПРОВЕРКА EMAIL
+                if msg_type == 'check_email':
+                    email = data['email']
+                    c.execute("SELECT user_id, username FROM users WHERE email = ?", (email,))
+                    user = c.fetchone()
+                    
                     await websocket.send(json.dumps({
-                        'type': 'code_invalid',
-                        'message': 'Код не найден'
+                        'type': 'email_exists',
+                        'exists': user is not None
                     }))
                     
-            elif msg_type == 'create_password':
-                email = data['email']
-                password = data['password']
-                password_hash = hash_password(password)
-                
-                await websocket.send(json.dumps({
-                    'type': 'password_created',
-                    'email': email,
-                    'password_hash': password_hash
-                }))
-                
-            elif msg_type == 'complete_registration':
-                email = data['email']
-                username = data['username']
-                password_hash = data['password_hash']
-                first_name = data.get('first_name', '')
-                last_name = data.get('last_name', '')
-                
-                # Проверяем, не занят ли username
-                c.execute("SELECT username FROM users WHERE username = ?", (username,))
-                if c.fetchone():
-                    await websocket.send(json.dumps({
-                        'type': 'register_failed',
-                        'message': 'Имя пользователя уже занято'
-                    }))
-                    return
-                
-                # Проверяем, не занят ли email
-                c.execute("SELECT email FROM users WHERE email = ?", (email,))
-                if c.fetchone():
-                    await websocket.send(json.dumps({
-                        'type': 'register_failed',
-                        'message': 'Этот email уже зарегистрирован'
-                    }))
-                    return
-                
-                # Создаем пользователя
-                user_id = f"user_{int(datetime.now().timestamp())}"
-                c.execute("INSERT INTO users (user_id, email, username, password_hash, first_name, last_name, verified, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-                         (user_id, email, username, password_hash, first_name, last_name, datetime.now()))
-                conn.commit()
-                
-                connected_clients[user_id] = websocket
-                
-                await websocket.send(json.dumps({
-                    'type': 'register_success',
-                    'user_id': user_id,
-                    'username': username
-                }))
-                
-            elif msg_type == 'login_with_password':
-                email = data['email']
-                password = data['password']
-                
-                c.execute("SELECT user_id, username, password_hash, first_name, last_name FROM users WHERE email = ?", (email,))
-                user = c.fetchone()
-                
-                if user:
-                    user_id, username, password_hash, first_name, last_name = user
-                    if verify_password(password, password_hash):
-                        connected_clients[user_id] = websocket
+                # 2️⃣ ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ПОЛЬЗОВАТЕЛЕ (НОВОЕ!)
+                elif msg_type == 'get_user_info':
+                    user_id = data['user_id']
+                    c.execute("SELECT username, first_name, last_name FROM users WHERE user_id = ?", (user_id,))
+                    user = c.fetchone()
+                    
+                    if user:
+                        username, first_name, last_name = user
                         await websocket.send(json.dumps({
-                            'type': 'login_success',
+                            'type': 'user_info',
                             'user_id': user_id,
                             'username': username,
                             'first_name': first_name,
@@ -223,58 +145,213 @@ async def handler(websocket):
                         }))
                     else:
                         await websocket.send(json.dumps({
-                            'type': 'login_failed',
-                            'message': 'Неверный пароль'
+                            'type': 'user_info',
+                            'user_id': user_id,
+                            'username': user_id,
+                            'first_name': '',
+                            'last_name': ''
                         }))
-                else:
-                    await websocket.send(json.dumps({
-                        'type': 'login_failed',
-                        'message': 'Пользователь не найден'
-                    }))
-                    
-            elif msg_type == 'search_user':
-                search_username = data['username']
-                c.execute("SELECT user_id, username, first_name, last_name FROM users WHERE username = ?", (search_username,))
-                user = c.fetchone()
                 
-                if user:
-                    user_id, username, first_name, last_name = user
+                # 3️⃣ ОТПРАВКА КОДА
+                elif msg_type == 'send_code':
+                    email = data['email']
+                    code = generate_verification_code()
+                    
+                    c.execute("DELETE FROM verification_codes WHERE email = ?", (email,))
+                    expires = datetime.now().timestamp() + 300
+                    c.execute("INSERT INTO verification_codes (email, code, expires_at) VALUES (?, ?, ?)",
+                             (email, code, expires))
+                    conn.commit()
+                    
+                    show_code_in_logs(email, code)
+                    
                     await websocket.send(json.dumps({
-                        'type': 'search_result',
-                        'found': True,
+                        'type': 'code_sent',
+                        'message': 'Код отправлен (проверьте логи)'
+                    }))
+                
+                # 4️⃣ ПРОВЕРКА КОДА
+                elif msg_type == 'verify_code':
+                    email = data['email']
+                    code = data['code']
+                    
+                    c.execute("SELECT code, expires_at FROM verification_codes WHERE email = ? ORDER BY id DESC LIMIT 1", (email,))
+                    result = c.fetchone()
+                    
+                    if result:
+                        stored_code, expires_at = result
+                        if datetime.now().timestamp() < expires_at and stored_code == code:
+                            await websocket.send(json.dumps({
+                                'type': 'code_valid',
+                                'email': email
+                            }))
+                        else:
+                            await websocket.send(json.dumps({
+                                'type': 'code_invalid',
+                                'message': 'Неверный или просроченный код'
+                            }))
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'code_invalid',
+                            'message': 'Код не найден'
+                        }))
+                
+                # 5️⃣ СОЗДАНИЕ ПАРОЛЯ
+                elif msg_type == 'create_password':
+                    email = data['email']
+                    password = data['password']
+                    password_hash = hash_password(password)
+                    
+                    await websocket.send(json.dumps({
+                        'type': 'password_created',
+                        'email': email,
+                        'password_hash': password_hash
+                    }))
+                
+                # 6️⃣ ЗАВЕРШЕНИЕ РЕГИСТРАЦИИ
+                elif msg_type == 'complete_registration':
+                    email = data['email']
+                    username = data['username']
+                    password_hash = data['password_hash']
+                    first_name = data.get('first_name', '')
+                    last_name = data.get('last_name', '')
+                    
+                    # Проверяем username
+                    c.execute("SELECT username FROM users WHERE username = ?", (username,))
+                    if c.fetchone():
+                        await websocket.send(json.dumps({
+                            'type': 'register_failed',
+                            'message': 'Имя пользователя уже занято'
+                        }))
+                        return
+                    
+                    # Проверяем email
+                    c.execute("SELECT email FROM users WHERE email = ?", (email,))
+                    if c.fetchone():
+                        await websocket.send(json.dumps({
+                            'type': 'register_failed',
+                            'message': 'Этот email уже зарегистрирован'
+                        }))
+                        return
+                    
+                    # Создаем пользователя
+                    user_id = f"user_{int(datetime.now().timestamp())}"
+                    c.execute("INSERT INTO users (user_id, email, username, password_hash, first_name, last_name, verified, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                             (user_id, email, username, password_hash, first_name, last_name, datetime.now()))
+                    conn.commit()
+                    
+                    connected_clients[user_id] = websocket
+                    
+                    await websocket.send(json.dumps({
+                        'type': 'register_success',
                         'user_id': user_id,
-                        'username': username,
-                        'first_name': first_name,
-                        'last_name': last_name
+                        'username': username
                     }))
-                else:
-                    await websocket.send(json.dumps({
-                        'type': 'search_result',
-                        'found': False
-                    }))
+                    log(f"🎉 New user: {username}")
+                
+                # 7️⃣ ВХОД С ПАРОЛЕМ
+                elif msg_type == 'login_with_password':
+                    email = data['email']
+                    password = data['password']
                     
-            elif msg_type == 'private_message':
-                from_user = data['from_user']
-                to_user = data['to_user']
-                message_text = data['message']
+                    c.execute("SELECT user_id, username, password_hash, first_name, last_name FROM users WHERE email = ?", (email,))
+                    user = c.fetchone()
+                    
+                    if user:
+                        user_id, username, password_hash, first_name, last_name = user
+                        if verify_password(password, password_hash):
+                            connected_clients[user_id] = websocket
+                            await websocket.send(json.dumps({
+                                'type': 'login_success',
+                                'user_id': user_id,
+                                'username': username,
+                                'first_name': first_name,
+                                'last_name': last_name
+                            }))
+                            log(f"✅ Login: {username}")
+                        else:
+                            await websocket.send(json.dumps({
+                                'type': 'login_failed',
+                                'message': 'Неверный пароль'
+                            }))
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'login_failed',
+                            'message': 'Пользователь не найден'
+                        }))
                 
-                c.execute("INSERT INTO messages (from_user, to_user, message, timestamp) VALUES (?, ?, ?, ?)",
-                         (from_user, to_user, message_text, datetime.now()))
-                conn.commit()
+                # 8️⃣ ПОИСК ПОЛЬЗОВАТЕЛЯ
+                elif msg_type == 'search_user':
+                    search_username = data['username']
+                    c.execute("SELECT user_id, username, first_name, last_name FROM users WHERE username = ?", (search_username,))
+                    user = c.fetchone()
+                    
+                    if user:
+                        user_id, username, first_name, last_name = user
+                        await websocket.send(json.dumps({
+                            'type': 'search_result',
+                            'found': True,
+                            'user_id': user_id,
+                            'username': username,
+                            'first_name': first_name,
+                            'last_name': last_name
+                        }))
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'search_result',
+                            'found': False
+                        }))
                 
-                if to_user in connected_clients:
-                    await connected_clients[to_user].send(json.dumps({
-                        'type': 'new_message',
-                        'from_user': from_user,
-                        'message': message_text,
-                        'timestamp': str(datetime.now())
+                # 9️⃣ ОТПРАВКА СООБЩЕНИЯ
+                elif msg_type == 'private_message':
+                    from_user = data['from_user']
+                    to_user = data['to_user']
+                    message_text = data['message']
+                    
+                    c.execute("INSERT INTO messages (from_user, to_user, message, timestamp) VALUES (?, ?, ?, ?)",
+                             (from_user, to_user, message_text, datetime.now()))
+                    conn.commit()
+                    
+                    if to_user in connected_clients:
+                        await connected_clients[to_user].send(json.dumps({
+                            'type': 'new_message',
+                            'from_user': from_user,
+                            'message': message_text,
+                            'timestamp': str(datetime.now())
+                        }))
+                    
+                    await websocket.send(json.dumps({
+                        'type': 'message_sent',
+                        'to_user': to_user,
+                        'message': message_text
                     }))
                 
-                await websocket.send(json.dumps({
-                    'type': 'message_sent',
-                    'to_user': to_user,
-                    'message': message_text
-                }))
+                # 🔟 ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ПОЛЬЗОВАТЕЛЕ (еще раз для надежности)
+                elif msg_type == 'get_user_info':
+                    user_id = data['user_id']
+                    c.execute("SELECT username, first_name, last_name FROM users WHERE user_id = ?", (user_id,))
+                    user = c.fetchone()
+                    
+                    if user:
+                        username, first_name, last_name = user
+                        await websocket.send(json.dumps({
+                            'type': 'user_info',
+                            'user_id': user_id,
+                            'username': username,
+                            'first_name': first_name,
+                            'last_name': last_name
+                        }))
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'user_info',
+                            'user_id': user_id,
+                            'username': user_id,
+                            'first_name': '',
+                            'last_name': ''
+                        }))
+                        
+            finally:
+                conn.close()
                 
     except websockets.exceptions.ConnectionClosed:
         log(f"👋 Client disconnected")
@@ -292,7 +369,8 @@ async def main():
     async with websockets.serve(handler, "0.0.0.0", port):
         log("=" * 60)
         log("🚀 SERVER STARTED SUCCESSFULLY!")
-        log("📡 Коды подтверждения будут показываться в логах")
+        log(f"📡 Port: {port}")
+        log(f"💾 Database: {DB_PATH}")
         log("=" * 60)
         await asyncio.Future()
 
