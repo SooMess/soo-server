@@ -3,27 +3,34 @@ import websockets
 import json
 import sqlite3
 import random
-import os
-import requests
+import smtplib
+import hashlib
+import secrets
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
+import os
 
 # ============================================
-# НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# НАСТРОЙКИ EMAIL (из переменных окружения)
 # ============================================
 
-# API ключ для SMS (берется из переменных окружения Render)
-MOBILE_TEXT_ALERTS_API_KEY = os.environ.get('MOBILE_TEXT_ALERTS_API_KEY', '')
+EMAIL_HOST = "smtp.gmail.com"  # или smtp.mail.ru, smtp.yandex.ru
+EMAIL_PORT = 587
+EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS', '')
+EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', '')
 
 # База данных
 conn = sqlite3.connect('soo_messages.db')
 c = conn.cursor()
 
-# Создаем таблицы если их нет
+# Создаем таблицы
 c.execute('''CREATE TABLE IF NOT EXISTS users
              (id INTEGER PRIMARY KEY AUTOINCREMENT,
               user_id TEXT UNIQUE,
-              phone TEXT UNIQUE,
+              email TEXT UNIQUE,
               username TEXT UNIQUE,
+              password_hash TEXT,
               first_name TEXT,
               last_name TEXT,
               verified BOOLEAN DEFAULT 0,
@@ -31,7 +38,7 @@ c.execute('''CREATE TABLE IF NOT EXISTS users
 
 c.execute('''CREATE TABLE IF NOT EXISTS verification_codes
              (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              phone TEXT,
+              email TEXT,
               code TEXT,
               expires_at TIMESTAMP,
               attempts INTEGER DEFAULT 0)''')
@@ -49,54 +56,62 @@ conn.commit()
 connected_clients = {}  # {user_id: websocket}
 
 # ============================================
-# ФУНКЦИИ ДЛЯ SMS
+# ФУНКЦИИ ДЛЯ EMAIL И КОДОВ
 # ============================================
 
 def generate_verification_code():
     """Генерирует 4-значный код подтверждения"""
     return str(random.randint(1000, 9999))
 
-def send_sms_via_mobile_text_alerts(phone, code):
-    """Отправляет SMS через Mobile Text Alerts API"""
+def hash_password(password):
+    """Хеширует пароль"""
+    salt = secrets.token_hex(16)
+    hash_obj = hashlib.sha256((password + salt).encode())
+    return f"{salt}${hash_obj.hexdigest()}"
+
+def verify_password(password, password_hash):
+    """Проверяет пароль"""
+    salt, hash_val = password_hash.split('$')
+    check_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+    return check_hash == hash_val
+
+def send_email_code(to_email, code):
+    """Отправляет код подтверждения на email"""
     
-    # Если API ключ не настроен, просто логируем код
-    if not MOBILE_TEXT_ALERTS_API_KEY:
-        print(f"⚠️ API ключ не настроен. Код для {phone}: {code}")
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
+        print(f"⚠️ Email не настроен. Код для {to_email}: {code}")
         return False
-    
-    url = "https://api.mobile-text-alerts.com/v3/messages"
-    
-    headers = {
-        "Authorization": f"Bearer {MOBILE_TEXT_ALERTS_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    # Форматируем номер (убираем все кроме цифр и +)
-    clean_phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
-    
-    payload = {
-        "recipients": [clean_phone],
-        "message": f"Ваш код подтверждения Soo: {code}",
-        "message_type": "SMS"
-    }
     
     try:
-        print(f"📤 Отправка SMS на {clean_phone}...")
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-        result = response.json()
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_ADDRESS
+        msg['To'] = to_email
+        msg['Subject'] = "Код подтверждения Soo Messenger"
         
-        if response.status_code == 200:
-            print(f"✅ SMS успешно отправлено на {phone}: {result}")
-            return True
-        else:
-            print(f"❌ Ошибка SMS API: {response.status_code} - {result}")
-            return False
-            
-    except requests.exceptions.Timeout:
-        print(f"⏱️ Таймаут при отправке SMS на {phone}")
-        return False
+        body = f"""
+        <html>
+          <body style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2 style="color: #6200EE;">Soo Messenger</h2>
+            <p>Ваш код подтверждения:</p>
+            <h1 style="font-size: 32px; background: #f0f0f0; padding: 10px; text-align: center;">{code}</h1>
+            <p>Код действителен 5 минут.</p>
+          </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(body, 'html'))
+        
+        server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+        server.starttls()
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        print(f"📧 Email отправлен на {to_email} с кодом {code}")
+        return True
+        
     except Exception as e:
-        print(f"❌ Ошибка отправки SMS: {e}")
+        print(f"❌ Ошибка отправки email: {e}")
         return False
 
 # ============================================
@@ -104,7 +119,6 @@ def send_sms_via_mobile_text_alerts(phone, code):
 # ============================================
 
 async def handler(websocket):
-    """Основной обработчик всех сообщений от клиентов"""
     try:
         async for message in websocket:
             data = json.loads(message)
@@ -112,125 +126,110 @@ async def handler(websocket):
             
             print(f"\n📨 Получен запрос: {msg_type}")
             
-            # 1️⃣ ПРОВЕРКА СУЩЕСТВОВАНИЯ НОМЕРА
-            if msg_type == 'check_phone':
-                phone = data['phone']
-                print(f"🔍 Проверка номера: {phone}")
+            # 1️⃣ ПРОВЕРКА EMAIL ПРИ ВХОДЕ
+            if msg_type == 'check_email':
+                email = data['email']
+                print(f"🔍 Проверка email: {email}")
                 
-                c.execute("SELECT user_id, username FROM users WHERE phone = ?", (phone,))
+                c.execute("SELECT user_id, username FROM users WHERE email = ?", (email,))
                 user = c.fetchone()
                 
                 if user:
                     await websocket.send(json.dumps({
-                        'type': 'phone_exists',
+                        'type': 'email_exists',
                         'exists': True
                     }))
-                    print(f"✅ Номер {phone} найден")
+                    print(f"✅ Email {email} найден")
                 else:
                     await websocket.send(json.dumps({
-                        'type': 'phone_exists',
+                        'type': 'email_exists',
                         'exists': False
                     }))
-                    print(f"❌ Номер {phone} не найден")
+                    print(f"❌ Email {email} не найден")
             
-            # 2️⃣ ОТПРАВКА КОДА ПОДТВЕРЖДЕНИЯ
+            # 2️⃣ ОТПРАВКА КОДА НА EMAIL
             elif msg_type == 'send_code':
-                phone = data['phone']
+                email = data['email']
                 code = generate_verification_code()
-                print(f"📱 Генерация кода для {phone}: {code}")
+                print(f"📧 Генерация кода для {email}: {code}")
                 
-                # Удаляем старые коды для этого номера
-                c.execute("DELETE FROM verification_codes WHERE phone = ?", (phone,))
-                
-                # Сохраняем новый код
+                c.execute("DELETE FROM verification_codes WHERE email = ?", (email,))
                 expires = datetime.now().timestamp() + 300  # 5 минут
-                c.execute("INSERT INTO verification_codes (phone, code, expires_at) VALUES (?, ?, ?)",
-                         (phone, code, expires))
+                c.execute("INSERT INTO verification_codes (email, code, expires_at) VALUES (?, ?, ?)",
+                         (email, code, expires))
                 conn.commit()
-                print(f"✅ Код {code} сохранен в БД")
                 
-                # ОТПРАВЛЯЕМ SMS (если ключ настроен)
-                sms_sent = send_sms_via_mobile_text_alerts(phone, code)
+                email_sent = send_email_code(email, code)
                 
-                if sms_sent:
-                    await websocket.send(json.dumps({
-                        'type': 'code_sent',
-                        'message': 'Код отправлен через SMS'
-                    }))
-                    print(f"✅ SMS отправлено на {phone}")
-                else:
-                    # Если SMS не отправилось, показываем код в логах Render
-                    print(f"⚠️ Код для {phone}: {code}")
-                    await websocket.send(json.dumps({
-                        'type': 'code_sent',
-                        'message': f'Код отправлен (тестовый режим)'
-                    }))
+                await websocket.send(json.dumps({
+                    'type': 'code_sent',
+                    'message': 'Код отправлен на email'
+                }))
             
             # 3️⃣ ПРОВЕРКА КОДА
             elif msg_type == 'verify_code':
-                phone = data['phone']
+                email = data['email']
                 code = data['code']
-                print(f"🔐 Проверка кода для {phone}: {code}")
+                print(f"🔐 Проверка кода для {email}: {code}")
                 
-                c.execute("SELECT code, expires_at FROM verification_codes WHERE phone = ? ORDER BY id DESC LIMIT 1", (phone,))
+                c.execute("SELECT code, expires_at FROM verification_codes WHERE email = ? ORDER BY id DESC LIMIT 1", (email,))
                 result = c.fetchone()
                 
                 if result:
                     stored_code, expires_at = result
-                    print(f"   Найден код: {stored_code}, истекает: {expires_at}")
-                    
                     if datetime.now().timestamp() < expires_at and stored_code == code:
                         await websocket.send(json.dumps({
                             'type': 'code_valid',
-                            'phone': phone
+                            'email': email
                         }))
-                        print(f"✅ Код верный для {phone}")
+                        print(f"✅ Код верный для {email}")
                     else:
                         await websocket.send(json.dumps({
                             'type': 'code_invalid',
                             'message': 'Неверный или просроченный код'
                         }))
-                        print(f"❌ Неверный код для {phone}")
                 else:
                     await websocket.send(json.dumps({
                         'type': 'code_invalid',
                         'message': 'Код не найден'
                     }))
-                    print(f"❌ Код для {phone} не найден")
             
-            # 4️⃣ РЕГИСТРАЦИЯ НОВОГО ПОЛЬЗОВАТЕЛЯ
-            elif msg_type == 'register':
-                phone = data['phone']
+            # 4️⃣ СОЗДАНИЕ ПАРОЛЯ (для новых пользователей)
+            elif msg_type == 'create_password':
+                email = data['email']
+                password = data['password']
+                print(f"🔑 Создание пароля для {email}")
+                
+                # Временно храним пароль в сессии (email -> hash)
+                password_hash = hash_password(password)
+                
+                await websocket.send(json.dumps({
+                    'type': 'password_created',
+                    'email': email,
+                    'password_hash': password_hash
+                }))
+            
+            # 5️⃣ ПОЛНАЯ РЕГИСТРАЦИЯ
+            elif msg_type == 'complete_registration':
+                email = data['email']
                 username = data['username']
+                password_hash = data['password_hash']
                 first_name = data.get('first_name', '')
                 last_name = data.get('last_name', '')
                 
-                print(f"📝 Регистрация: {username} ({phone})")
+                print(f"📝 Регистрация: {username} ({email})")
                 
-                # Проверяем, не занят ли username
                 c.execute("SELECT username FROM users WHERE username = ?", (username,))
                 if c.fetchone():
                     await websocket.send(json.dumps({
                         'type': 'register_failed',
                         'message': 'Имя пользователя уже занято'
                     }))
-                    print(f"❌ Username {username} уже занят")
                     return
                 
-                # Проверяем, не занят ли телефон
-                c.execute("SELECT phone FROM users WHERE phone = ?", (phone,))
-                if c.fetchone():
-                    await websocket.send(json.dumps({
-                        'type': 'register_failed',
-                        'message': 'Этот номер уже зарегистрирован'
-                    }))
-                    print(f"❌ Телефон {phone} уже зарегистрирован")
-                    return
-                
-                # Создаем пользователя
                 user_id = f"user_{int(datetime.now().timestamp())}"
-                c.execute("INSERT INTO users (user_id, phone, username, first_name, last_name, verified, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
-                         (user_id, phone, username, first_name, last_name, datetime.now()))
+                c.execute("INSERT INTO users (user_id, email, username, password_hash, first_name, last_name, verified, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                         (user_id, email, username, password_hash, first_name, last_name, datetime.now()))
                 conn.commit()
                 
                 connected_clients[user_id] = websocket
@@ -240,40 +239,43 @@ async def handler(websocket):
                     'user_id': user_id,
                     'username': username
                 }))
-                print(f"🎉 Новый пользователь: {username} ({phone})")
+                print(f"🎉 Новый пользователь: {username}")
             
-            # 5️⃣ ВХОД ПО НОМЕРУ ТЕЛЕФОНА
-            elif msg_type == 'login':
-                phone = data['phone']
-                print(f"🔓 Попытка входа: {phone}")
+            # 6️⃣ ВХОД С ПАРОЛЕМ
+            elif msg_type == 'login_with_password':
+                email = data['email']
+                password = data['password']
+                print(f"🔓 Вход с паролем: {email}")
                 
-                c.execute("SELECT user_id, username, first_name, last_name FROM users WHERE phone = ? AND verified = 1", (phone,))
+                c.execute("SELECT user_id, username, password_hash, first_name, last_name FROM users WHERE email = ?", (email,))
                 user = c.fetchone()
                 
                 if user:
-                    user_id, username, first_name, last_name = user
-                    connected_clients[user_id] = websocket
-                    
-                    await websocket.send(json.dumps({
-                        'type': 'login_success',
-                        'user_id': user_id,
-                        'username': username,
-                        'first_name': first_name,
-                        'last_name': last_name
-                    }))
-                    print(f"✅ Успешный вход: {username}")
+                    user_id, username, password_hash, first_name, last_name = user
+                    if verify_password(password, password_hash):
+                        connected_clients[user_id] = websocket
+                        await websocket.send(json.dumps({
+                            'type': 'login_success',
+                            'user_id': user_id,
+                            'username': username,
+                            'first_name': first_name,
+                            'last_name': last_name
+                        }))
+                        print(f"✅ Успешный вход: {username}")
+                    else:
+                        await websocket.send(json.dumps({
+                            'type': 'login_failed',
+                            'message': 'Неверный пароль'
+                        }))
                 else:
                     await websocket.send(json.dumps({
                         'type': 'login_failed',
                         'message': 'Пользователь не найден'
                     }))
-                    print(f"❌ Пользователь с номером {phone} не найден")
             
-            # 6️⃣ ПОИСК ПОЛЬЗОВАТЕЛЯ ПО USERNAME
+            # 7️⃣ ПОИСК ПОЛЬЗОВАТЕЛЯ
             elif msg_type == 'search_user':
                 search_username = data['username']
-                print(f"🔍 Поиск пользователя: {search_username}")
-                
                 c.execute("SELECT user_id, username, first_name, last_name FROM users WHERE username = ?", (search_username,))
                 user = c.fetchone()
                 
@@ -287,28 +289,22 @@ async def handler(websocket):
                         'first_name': first_name,
                         'last_name': last_name
                     }))
-                    print(f"✅ Найден пользователь: {username}")
                 else:
                     await websocket.send(json.dumps({
                         'type': 'search_result',
                         'found': False
                     }))
-                    print(f"❌ Пользователь {search_username} не найден")
             
-            # 7️⃣ ОТПРАВКА ЛИЧНОГО СООБЩЕНИЯ
+            # 8️⃣ ОТПРАВКА СООБЩЕНИЯ
             elif msg_type == 'private_message':
                 from_user = data['from_user']
                 to_user = data['to_user']
                 message_text = data['message']
                 
-                print(f"💬 Сообщение от {from_user} к {to_user}: {message_text[:20]}...")
-                
-                # Сохраняем в БД
                 c.execute("INSERT INTO messages (from_user, to_user, message, timestamp) VALUES (?, ?, ?, ?)",
                          (from_user, to_user, message_text, datetime.now()))
                 conn.commit()
                 
-                # Отправляем получателю, если он онлайн
                 if to_user in connected_clients:
                     await connected_clients[to_user].send(json.dumps({
                         'type': 'new_message',
@@ -316,11 +312,7 @@ async def handler(websocket):
                         'message': message_text,
                         'timestamp': str(datetime.now())
                     }))
-                    print(f"✅ Сообщение доставлено {to_user}")
-                else:
-                    print(f"⚠️ Пользователь {to_user} не в сети")
                 
-                # Подтверждение отправителю
                 await websocket.send(json.dumps({
                     'type': 'message_sent',
                     'to_user': to_user,
@@ -328,31 +320,26 @@ async def handler(websocket):
                 }))
                 
     except websockets.exceptions.ConnectionClosed:
-        print("👋 Клиент отключился")
-        # Удаляем отключившегося клиента
         for user_id, ws in list(connected_clients.items()):
             if ws == websocket:
                 del connected_clients[user_id]
-                print(f"   Пользователь {user_id} удален")
                 break
 
 # ============================================
-# ЗАПУСК СЕРВЕРА
+# ЗАПУСК
 # ============================================
 
 async def main():
-    """Запуск сервера"""
     async with websockets.serve(handler, "0.0.0.0", 8765):
         print("=" * 50)
         print("🚀 Soo Messenger Server запущен!")
         print("📡 Порт: 8765")
-        print("💾 База данных: soo_messages.db")
-        if MOBILE_TEXT_ALERTS_API_KEY:
-            print("📱 SMS: Mobile Text Alerts подключен")
+        if EMAIL_ADDRESS and EMAIL_PASSWORD:
+            print(f"📧 Email: {EMAIL_ADDRESS}")
         else:
-            print("📱 SMS: не настроен (коды в логах)")
+            print("📧 Email: не настроен (коды в логах)")
         print("=" * 50)
-        await asyncio.Future()  # Работаем вечно
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
