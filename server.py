@@ -3,7 +3,16 @@ import websockets
 import json
 import sqlite3
 import random
+import os
+import requests
 from datetime import datetime
+
+# ============================================
+# НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ============================================
+
+# API ключ для SMS (берется из переменных окружения Render)
+MOBILE_TEXT_ALERTS_API_KEY = os.environ.get('MOBILE_TEXT_ALERTS_API_KEY', '')
 
 # База данных
 conn = sqlite3.connect('soo_messages.db')
@@ -39,9 +48,60 @@ conn.commit()
 
 connected_clients = {}  # {user_id: websocket}
 
+# ============================================
+# ФУНКЦИИ ДЛЯ SMS
+# ============================================
+
 def generate_verification_code():
     """Генерирует 4-значный код подтверждения"""
     return str(random.randint(1000, 9999))
+
+def send_sms_via_mobile_text_alerts(phone, code):
+    """Отправляет SMS через Mobile Text Alerts API"""
+    
+    # Если API ключ не настроен, просто логируем код
+    if not MOBILE_TEXT_ALERTS_API_KEY:
+        print(f"⚠️ API ключ не настроен. Код для {phone}: {code}")
+        return False
+    
+    url = "https://api.mobile-text-alerts.com/v3/messages"
+    
+    headers = {
+        "Authorization": f"Bearer {MOBILE_TEXT_ALERTS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # Форматируем номер (убираем все кроме цифр и +)
+    clean_phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+    
+    payload = {
+        "recipients": [clean_phone],
+        "message": f"Ваш код подтверждения Soo: {code}",
+        "message_type": "SMS"
+    }
+    
+    try:
+        print(f"📤 Отправка SMS на {clean_phone}...")
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        result = response.json()
+        
+        if response.status_code == 200:
+            print(f"✅ SMS успешно отправлено на {phone}: {result}")
+            return True
+        else:
+            print(f"❌ Ошибка SMS API: {response.status_code} - {result}")
+            return False
+            
+    except requests.exceptions.Timeout:
+        print(f"⏱️ Таймаут при отправке SMS на {phone}")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка отправки SMS: {e}")
+        return False
+
+# ============================================
+# ОСНОВНОЙ ОБРАБОТЧИК
+# ============================================
 
 async def handler(websocket):
     """Основной обработчик всех сообщений от клиентов"""
@@ -50,7 +110,7 @@ async def handler(websocket):
             data = json.loads(message)
             msg_type = data.get('type')
             
-            print(f"📨 Получен запрос: {msg_type}")
+            print(f"\n📨 Получен запрос: {msg_type}")
             
             # 1️⃣ ПРОВЕРКА СУЩЕСТВОВАНИЯ НОМЕРА
             if msg_type == 'check_phone':
@@ -87,13 +147,24 @@ async def handler(websocket):
                 c.execute("INSERT INTO verification_codes (phone, code, expires_at) VALUES (?, ?, ?)",
                          (phone, code, expires))
                 conn.commit()
+                print(f"✅ Код {code} сохранен в БД")
                 
-                print(f"✅ Код {code} сохранен для {phone}")
+                # ОТПРАВЛЯЕМ SMS (если ключ настроен)
+                sms_sent = send_sms_via_mobile_text_alerts(phone, code)
                 
-                await websocket.send(json.dumps({
-                    'type': 'code_sent',
-                    'message': 'Код отправлен'
-                }))
+                if sms_sent:
+                    await websocket.send(json.dumps({
+                        'type': 'code_sent',
+                        'message': 'Код отправлен через SMS'
+                    }))
+                    print(f"✅ SMS отправлено на {phone}")
+                else:
+                    # Если SMS не отправилось, показываем код в логах Render
+                    print(f"⚠️ Код для {phone}: {code}")
+                    await websocket.send(json.dumps({
+                        'type': 'code_sent',
+                        'message': f'Код отправлен (тестовый режим)'
+                    }))
             
             # 3️⃣ ПРОВЕРКА КОДА
             elif msg_type == 'verify_code':
@@ -265,6 +336,10 @@ async def handler(websocket):
                 print(f"   Пользователь {user_id} удален")
                 break
 
+# ============================================
+# ЗАПУСК СЕРВЕРА
+# ============================================
+
 async def main():
     """Запуск сервера"""
     async with websockets.serve(handler, "0.0.0.0", 8765):
@@ -272,6 +347,10 @@ async def main():
         print("🚀 Soo Messenger Server запущен!")
         print("📡 Порт: 8765")
         print("💾 База данных: soo_messages.db")
+        if MOBILE_TEXT_ALERTS_API_KEY:
+            print("📱 SMS: Mobile Text Alerts подключен")
+        else:
+            print("📱 SMS: не настроен (коды в логах)")
         print("=" * 50)
         await asyncio.Future()  # Работаем вечно
 
