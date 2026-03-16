@@ -38,7 +38,6 @@ c.execute('''CREATE TABLE IF NOT EXISTS messages
 conn.commit()
 
 connected_clients = {}  # {user_id: websocket}
-temp_sessions = {}  # {phone: {"code": ..., "expires": ...}}
 
 def generate_verification_code():
     """Генерирует 4-значный код подтверждения"""
@@ -51,9 +50,13 @@ async def handler(websocket):
             data = json.loads(message)
             msg_type = data.get('type')
             
+            print(f"📨 Получен запрос: {msg_type}")
+            
             # 1️⃣ ПРОВЕРКА СУЩЕСТВОВАНИЯ НОМЕРА
             if msg_type == 'check_phone':
                 phone = data['phone']
+                print(f"🔍 Проверка номера: {phone}")
+                
                 c.execute("SELECT user_id, username FROM users WHERE phone = ?", (phone,))
                 user = c.fetchone()
                 
@@ -62,28 +65,30 @@ async def handler(websocket):
                         'type': 'phone_exists',
                         'exists': True
                     }))
+                    print(f"✅ Номер {phone} найден")
                 else:
                     await websocket.send(json.dumps({
                         'type': 'phone_exists',
                         'exists': False
                     }))
-                print(f"Проверка номера {phone}: {'найден' if user else 'не найден'}")
+                    print(f"❌ Номер {phone} не найден")
             
             # 2️⃣ ОТПРАВКА КОДА ПОДТВЕРЖДЕНИЯ
             elif msg_type == 'send_code':
                 phone = data['phone']
                 code = generate_verification_code()
+                print(f"📱 Генерация кода для {phone}: {code}")
                 
                 # Удаляем старые коды для этого номера
                 c.execute("DELETE FROM verification_codes WHERE phone = ?", (phone,))
                 
-                # Сохраняем новый код (в реальном проекте тут отправка SMS)
+                # Сохраняем новый код
                 expires = datetime.now().timestamp() + 300  # 5 минут
                 c.execute("INSERT INTO verification_codes (phone, code, expires_at) VALUES (?, ?, ?)",
                          (phone, code, expires))
                 conn.commit()
                 
-                print(f"📱 Код для {phone}: {code}")  # В консоль для теста
+                print(f"✅ Код {code} сохранен для {phone}")
                 
                 await websocket.send(json.dumps({
                     'type': 'code_sent',
@@ -94,12 +99,15 @@ async def handler(websocket):
             elif msg_type == 'verify_code':
                 phone = data['phone']
                 code = data['code']
+                print(f"🔐 Проверка кода для {phone}: {code}")
                 
                 c.execute("SELECT code, expires_at FROM verification_codes WHERE phone = ? ORDER BY id DESC LIMIT 1", (phone,))
                 result = c.fetchone()
                 
                 if result:
                     stored_code, expires_at = result
+                    print(f"   Найден код: {stored_code}, истекает: {expires_at}")
+                    
                     if datetime.now().timestamp() < expires_at and stored_code == code:
                         await websocket.send(json.dumps({
                             'type': 'code_valid',
@@ -117,6 +125,7 @@ async def handler(websocket):
                         'type': 'code_invalid',
                         'message': 'Код не найден'
                     }))
+                    print(f"❌ Код для {phone} не найден")
             
             # 4️⃣ РЕГИСТРАЦИЯ НОВОГО ПОЛЬЗОВАТЕЛЯ
             elif msg_type == 'register':
@@ -125,6 +134,8 @@ async def handler(websocket):
                 first_name = data.get('first_name', '')
                 last_name = data.get('last_name', '')
                 
+                print(f"📝 Регистрация: {username} ({phone})")
+                
                 # Проверяем, не занят ли username
                 c.execute("SELECT username FROM users WHERE username = ?", (username,))
                 if c.fetchone():
@@ -132,6 +143,7 @@ async def handler(websocket):
                         'type': 'register_failed',
                         'message': 'Имя пользователя уже занято'
                     }))
+                    print(f"❌ Username {username} уже занят")
                     return
                 
                 # Проверяем, не занят ли телефон
@@ -141,6 +153,7 @@ async def handler(websocket):
                         'type': 'register_failed',
                         'message': 'Этот номер уже зарегистрирован'
                     }))
+                    print(f"❌ Телефон {phone} уже зарегистрирован")
                     return
                 
                 # Создаем пользователя
@@ -161,6 +174,8 @@ async def handler(websocket):
             # 5️⃣ ВХОД ПО НОМЕРУ ТЕЛЕФОНА
             elif msg_type == 'login':
                 phone = data['phone']
+                print(f"🔓 Попытка входа: {phone}")
+                
                 c.execute("SELECT user_id, username, first_name, last_name FROM users WHERE phone = ? AND verified = 1", (phone,))
                 user = c.fetchone()
                 
@@ -175,16 +190,19 @@ async def handler(websocket):
                         'first_name': first_name,
                         'last_name': last_name
                     }))
-                    print(f"🔓 Вошел пользователь: {username}")
+                    print(f"✅ Успешный вход: {username}")
                 else:
                     await websocket.send(json.dumps({
                         'type': 'login_failed',
                         'message': 'Пользователь не найден'
                     }))
+                    print(f"❌ Пользователь с номером {phone} не найден")
             
             # 6️⃣ ПОИСК ПОЛЬЗОВАТЕЛЯ ПО USERNAME
             elif msg_type == 'search_user':
                 search_username = data['username']
+                print(f"🔍 Поиск пользователя: {search_username}")
+                
                 c.execute("SELECT user_id, username, first_name, last_name FROM users WHERE username = ?", (search_username,))
                 user = c.fetchone()
                 
@@ -198,17 +216,21 @@ async def handler(websocket):
                         'first_name': first_name,
                         'last_name': last_name
                     }))
+                    print(f"✅ Найден пользователь: {username}")
                 else:
                     await websocket.send(json.dumps({
                         'type': 'search_result',
                         'found': False
                     }))
+                    print(f"❌ Пользователь {search_username} не найден")
             
             # 7️⃣ ОТПРАВКА ЛИЧНОГО СООБЩЕНИЯ
             elif msg_type == 'private_message':
                 from_user = data['from_user']
                 to_user = data['to_user']
                 message_text = data['message']
+                
+                print(f"💬 Сообщение от {from_user} к {to_user}: {message_text[:20]}...")
                 
                 # Сохраняем в БД
                 c.execute("INSERT INTO messages (from_user, to_user, message, timestamp) VALUES (?, ?, ?, ?)",
@@ -223,6 +245,9 @@ async def handler(websocket):
                         'message': message_text,
                         'timestamp': str(datetime.now())
                     }))
+                    print(f"✅ Сообщение доставлено {to_user}")
+                else:
+                    print(f"⚠️ Пользователь {to_user} не в сети")
                 
                 # Подтверждение отправителю
                 await websocket.send(json.dumps({
@@ -232,11 +257,12 @@ async def handler(websocket):
                 }))
                 
     except websockets.exceptions.ConnectionClosed:
+        print("👋 Клиент отключился")
         # Удаляем отключившегося клиента
         for user_id, ws in list(connected_clients.items()):
             if ws == websocket:
                 del connected_clients[user_id]
-                print(f"👋 Пользователь {user_id} отключился")
+                print(f"   Пользователь {user_id} удален")
                 break
 
 async def main():
